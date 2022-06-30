@@ -508,9 +508,18 @@ class PGLogger(bdb.Bdb):
     #
     # if separate_stdout_by_module, then have a separate stdout stream
     # for each module rather than all stdout going to a single stream
-    def __init__(self, cumulative_mode, heap_primitives, show_only_outputs, finalizer_func,
-                 disable_security_checks=False, allow_all_modules=False, crazy_mode=False,
-                 custom_modules=None, separate_stdout_by_module=False, probe_exprs=None):
+    def __init__(
+            self,
+            cumulative_mode,
+            heap_primitives,
+            show_only_outputs,
+            finalizer_func,
+            disable_security_checks=False,
+            allow_all_modules=False,
+            crazy_mode=False,
+            custom_modules=None,
+            separate_stdout_by_module=False,
+            probe_exprs=None):
         bdb.Bdb.__init__(self)
         self.mainpyfile = ''
         self._wait_for_mainpyfile = 0
@@ -1321,10 +1330,7 @@ class PGLogger(bdb.Bdb):
 
         self.forget()
 
-    def _runscript(self, script_str):
-        self.executed_script = script_str
-        self.executed_script_lines = self.executed_script.splitlines()
-
+    def _set_exec_vars(self):
         for (i, line) in enumerate(self.executed_script_lines):
             line_no = i + 1
             # subtle -- if the stripped line starts with '#break', that
@@ -1350,23 +1356,7 @@ class PGLogger(bdb.Bdb):
                 listed_types = [compileGlobMatch(e.strip()) for e in listed_types.split(',')]
                 self.types_to_inline.update(listed_types)
 
-        # populate an extent map to get more accurate ranges from code
-        if self.crazy_mode:
-            # in Py2crazy standard library as Python-2.7.5/Lib/super_dis.py
-            import super_dis
-            try:
-                self.bytecode_map = super_dis.get_bytecode_map(self.executed_script)
-            except:
-                # failure oblivious
-                self.bytecode_map = {}
-
-        # When bdb sets tracing, a number of call and line events happens
-        # BEFORE debugger even reaches user's code (and the exact sequence of
-        # events depends on python version). So we take special measures to
-        # avoid stopping before we reach the main script (see user_line and
-        # user_call for details).
-        self._wait_for_mainpyfile = 1
-
+    def _get_user_builtins(self):
         # ok, let's try to sorta 'sandbox' the user script by not
         # allowing certain potentially dangerous operations.
         user_builtins = {}
@@ -1400,42 +1390,9 @@ class PGLogger(bdb.Bdb):
                         user_builtins[k] = python2_input_wrapper
                 else:
                     user_builtins[k] = v
+        return user_builtins
 
-        user_builtins['mouse_input'] = mouse_input_wrapper
-
-        if self.separate_stdout_by_module:
-            self.stdout_by_module["__main__"] = StringIO.StringIO()
-            if self.custom_modules:
-                for module_name in self.custom_modules:
-                    self.stdout_by_module[module_name] = StringIO.StringIO()
-            self.stdout_by_module["<other>"] = StringIO.StringIO()  # catch-all for all other modules we're NOT tracing
-            sys.stdout = self.stdout_by_module["<other>"]  # start with <other>
-        else:
-            # default -- a single unified stdout stream
-            self.user_stdout = StringIO.StringIO()
-            sys.stdout = self.user_stdout
-
-        self.ORIGINAL_STDERR = sys.stderr
-
-        # don't do this, or else certain kinds of errors, such as syntax
-        # errors, will be silently ignored. WEIRD!
-        # sys.stderr = NullDevice # silence errors
-
-        user_globals = {}
-
-        # if there are custom_modules, 'import' them into user_globals,
-        # which emulates "from <module> import *"
-        if self.custom_modules:
-            for mn in self.custom_modules:
-                # http://code.activestate.com/recipes/82234-importing-a-dynamically-generated-module/
-                new_m = imp.new_module(mn)
-                exec(self.custom_modules[mn], new_m.__dict__)  # exec in custom globals
-                user_globals.update(new_m.__dict__)
-
-        # important: do this LAST to get precedence over values in custom_modules
-        user_globals.update({"__name__": "__main__",
-                             "__builtins__": user_builtins})
-
+    def _try_load_run(self, script_str, user_globals):
         try:
             # if allow_all_modules is on, then try to parse script_str into an
             # AST, traverse the tree to find all modules that it imports, and then
@@ -1573,6 +1530,69 @@ class PGLogger(bdb.Bdb):
 
             raise bdb.BdbQuit  # need to forceably STOP execution
 
+    def _runscript(self, script_str):
+        # 对源码进行分割
+        self.executed_script = script_str
+        self.executed_script_lines = self.executed_script.splitlines()
+
+        self._set_exec_vars()
+
+        # populate an extent map to get more accurate ranges from code
+        if self.crazy_mode:
+            # in Py2crazy standard library as Python-2.7.5/Lib/super_dis.py
+            import super_dis
+            try:
+                self.bytecode_map = super_dis.get_bytecode_map(self.executed_script)
+            except:
+                # failure oblivious
+                self.bytecode_map = {}
+
+        # When bdb sets tracing, a number of call and line events happens
+        # BEFORE debugger even reaches user's code (and the exact sequence of
+        # events depends on python version). So we take special measures to
+        # avoid stopping before we reach the main script (see user_line and
+        # user_call for details).
+        self._wait_for_mainpyfile = 1
+
+        user_builtins = self._get_user_builtins()
+
+        user_builtins['mouse_input'] = mouse_input_wrapper
+
+        if self.separate_stdout_by_module:
+            self.stdout_by_module["__main__"] = StringIO.StringIO()
+            if self.custom_modules:
+                for module_name in self.custom_modules:
+                    self.stdout_by_module[module_name] = StringIO.StringIO()
+            self.stdout_by_module["<other>"] = StringIO.StringIO()  # catch-all for all other modules we're NOT tracing
+            sys.stdout = self.stdout_by_module["<other>"]  # start with <other>
+        else:
+            # default -- a single unified stdout stream
+            self.user_stdout = StringIO.StringIO()
+            sys.stdout = self.user_stdout
+
+        self.ORIGINAL_STDERR = sys.stderr
+
+        # don't do this, or else certain kinds of errors, such as syntax
+        # errors, will be silently ignored. WEIRD!
+        # sys.stderr = NullDevice # silence errors
+
+        user_globals = {}
+
+        # if there are custom_modules, 'import' them into user_globals,
+        # which emulates "from <module> import *"
+        if self.custom_modules:
+            for mn in self.custom_modules:
+                # http://code.activestate.com/recipes/82234-importing-a-dynamically-generated-module/
+                new_m = imp.new_module(mn)
+                exec(self.custom_modules[mn], new_m.__dict__)  # exec in custom globals
+                user_globals.update(new_m.__dict__)
+
+        # important: do this LAST to get precedence over values in custom_modules
+        user_globals.update({"__name__": "__main__",
+                             "__builtins__": user_builtins})
+
+        self._try_load_run(script_str, user_globals)
+
     def force_terminate(self):
         # self.finalize()
         raise bdb.BdbQuit  # need to forceably STOP execution
@@ -1663,6 +1683,7 @@ def exec_script_str_local(
         finalizer_func,
         probe_exprs=None,
         allow_all_modules=False):
+    # 核心运行过程记录类
     logger = PGLogger(
         cumulative_mode,
         heap_primitives,
